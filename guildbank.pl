@@ -47,7 +47,7 @@ use JSON::PP qw(encode_json decode_json);
 our $GUILDBANK_PREFIX        = 'guildbank:';  # by guild name
 our $GUILDBANK_LOG_MAX       = 200;          # cap logs
 our $GUILDBANK_LEADER_MAXRANK = 1;           # treat ranks 0..1 as guild leaders
-our $GUILDBANK_DEBUG         = 0;            # set to 1 to enable debug
+our $GUILDBANK_DEBUG         = 1;            # set to 1 to enable debug
 
 # -----------------------------------------------------
 # Debug helpers
@@ -76,16 +76,18 @@ sub guildbank_handle_say {
     # Only care about ?donate / ?guildbank
     return 0 unless $text =~ /^\?(donate|guildbank)\b/i;
 
-    my $guild_id = $client->GuildID();
+    # Authoritative guild check via DB
+    my ($guild_id, $guild_name) = _gb_get_guild_for_client($client);
     if (!$guild_id) {
         $client->Message(13, "You must be in a guild to use the guild bank.");
-        return 1;
+        return 1; # handled
     }
 
-    my $guild_name = quest::getguildnamebyid($guild_id) || "Guild$guild_id";
-    my $key        = _gb_key_for_guild($guild_name);
-    my $bank       = _gb_load_bank($key);
-    my $role       = _gb_role_for_client($client, $bank);  # leader/officer/member/none
+    my $key = _gb_key_for_guild($guild_name);
+    return 1 unless $key;  # safety
+
+    my $bank = _gb_load_bank($key);
+    my $role = _gb_role_for_client($client, $bank);  # leader/officer/member/none
 
     my ($root, @rest) = split(/\s+/, $text);
 
@@ -121,14 +123,20 @@ sub guildbank_handle_say {
     return 1;  # handled
 }
 
+
 # -----------------------------------------------------
 # Key + load/save helpers
 # -----------------------------------------------------
 sub _gb_key_for_guild {
     my ($guild_name) = @_;
-    $guild_name ||= 'UNKNOWN';
+
+    # Never generate a key for unguilded (prevents shared "no-guild" bank)
+    return undef unless defined $guild_name && length $guild_name;
+
+    # Original behavior:
     $guild_name =~ s/\s+/_/g;
     $guild_name =~ s/[^A-Za-z0-9_]/_/g;
+
     return $GUILDBANK_PREFIX . uc($guild_name);
 }
 
@@ -190,6 +198,36 @@ sub _gb_save_bank {
 #   officer = stored in bank.officers
 #   member  = everyone else in guild
 # -----------------------------------------------------
+sub _gb_get_guild_for_client {
+    my ($client) = @_;
+    return (0, undef) unless $client;
+
+    my $name = $client->GetCleanName();
+    return (0, undef) unless defined $name && length $name;
+
+    my $dbh = plugin::LoadMysql();
+    return (0, undef) unless $dbh;
+
+    # character_data.id <-> guild_members.char_id
+    my $sql = q{
+        SELECT gm.guild_id
+        FROM character_data AS c
+        JOIN guild_members AS gm ON gm.char_id = c.id
+        WHERE c.name = ?
+        LIMIT 1
+    };
+
+    my $sth = $dbh->prepare($sql);
+    $sth->execute($name);
+    my ($gid) = $sth->fetchrow_array();
+    $sth->finish();
+
+    return (0, undef) unless $gid && $gid > 0;
+
+    my $gname = quest::getguildnamebyid($gid) || "Guild$gid";
+    return ($gid, $gname);
+}
+
 sub _gb_role_for_client {
     my ($client, $bank) = @_;
     return 'none' unless $client;
